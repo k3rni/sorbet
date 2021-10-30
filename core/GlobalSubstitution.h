@@ -19,7 +19,8 @@ class GlobalState;
  */
 class GlobalSubstitution {
 public:
-    GlobalSubstitution(const GlobalState &from, GlobalState &to, const GlobalState *optionalCommonParent = nullptr);
+    GlobalSubstitution(const GlobalState &from, GlobalState &to, const GlobalState *optionalCommonParent = nullptr,
+                       bool skipFiles = false);
 
     NameRef substitute(NameRef from, bool allowSameFromTo = false) const {
         if (!allowSameFromTo) {
