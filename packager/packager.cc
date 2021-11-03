@@ -60,6 +60,14 @@ struct FullyQualifiedName {
         ENFORCE(prefixed.size() == parts.size() + 1);
         return {move(prefixed), loc};
     }
+
+    bool isSuffix(const FullyQualifiedName &prefix) const {
+        if (prefix.parts.size() >= parts.size()) {
+            return false;
+        }
+
+        return std::equal(parts.begin(), parts.begin() + prefix.parts.size(), prefix.parts.begin());
+    }
 };
 
 class NameFormatter final {
@@ -734,11 +742,34 @@ public:
     ImportTreeBuilder &operator=(const ImportTreeBuilder &) = delete;
     ImportTreeBuilder &operator=(ImportTreeBuilder &&) = default;
 
-    void mergeImports(const PackageInfoImpl &importedPackage, const Import &import) {
-        for (const auto &exp : importedPackage.exports) {
-            if (exp.type == ExportType::Public) {
-                addImport(importedPackage, import.name.loc, exp.fqn, import.type);
-            }
+    void mergeImports(const PackageInfoImpl &importedPackage, const Import &import, bool enumerate) {
+        if (enumerate) {
+          for (const auto &exp : importedPackage.exports) {
+              if (exp.type == ExportType::Public) {
+                  addImport(importedPackage, import.name.loc, exp.fqn, import.type);
+              }
+          }
+        } else {
+          const bool exportsTestConstant = absl::c_any_of(
+              importedPackage.exports,
+              [&](const auto &exp) -> bool { 
+                return isPrimaryTestNamespace(exp.fqn.parts[0]);
+              }
+          );
+          const bool exportsRealConstant = absl::c_any_of(
+              importedPackage.exports,
+              [&](const auto &exp) -> bool { 
+                return !isPrimaryTestNamespace(exp.fqn.parts[0]);
+              }
+          );
+
+          if (exportsTestConstant) {
+            addImport(importedPackage, import.name.loc, import.name.fullTestPkgName, import.type);
+          }
+
+          if (exportsRealConstant) {
+            addImport(importedPackage, import.name.loc, import.name.fullName, import.type);
+          }
         }
     }
 
@@ -944,7 +975,14 @@ ast::ParsedFile rewritePackage(core::Context ctx, ast::ParsedFile file) {
                 }
             } else {
                 importedNames[imported.mangledName] = imported.loc;
-                treeBuilder.mergeImports(PackageInfoImpl::from(importedPackage), import);
+                // TODO (aadi-stripe): fix this so it's not quadratic
+                bool isOrImportsSubpackage = absl::c_any_of(
+                    package.importedPackageNames,
+                    [&](const auto &otherImport) -> bool { 
+                      return otherImport.name.fullName.isSuffix(imported.fullName);
+                    }
+                ) || package.name.fullName.isSuffix(imported.fullName); 
+                treeBuilder.mergeImports(PackageInfoImpl::from(importedPackage), import, isOrImportsSubpackage);
             }
         }
 
