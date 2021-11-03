@@ -1,0 +1,11 @@
+common --curses=no --color=yes
+startup --output_base=/Users/aprocter/.cache/sorbet/bazel-cache-out
+build  --disk_cache=/Users/aprocter/.cache/sorbet/bazel-cache --repository_cache=/Users/aprocter/.cache/sorbet/bazel-cache-repos
+test   --disk_cache=/Users/aprocter/.cache/sorbet/bazel-cache --repository_cache=/Users/aprocter/.cache/sorbet/bazel-cache-repos
+# Laptop builds with remote downloader but no remote execution/caching
+common:laptop --remote_cache_proxy=unix://Users/aprocter/.stripeproxy-grpc
+common:laptop --experimental_remote_downloader=grpc://remotebuild-downloader.northwest.corp.stripe.com
+common:laptop --remote_cache=grpc://remotebuild-storage.northwest.corp.stripe.com
+common:laptop --noremote_upload_local_results
+common:laptop --noremote_accept_cached
+common:laptop --incompatible_remote_results_ignore_disk
