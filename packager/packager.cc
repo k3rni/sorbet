@@ -96,7 +96,10 @@ struct PackageName {
 enum class ImportType {
     Normal,
     Test, // test_import
+    Self, // self import
 };
+
+enum class ModuleType { Normal, Test, ExportMappingNormal, ExportMappingTest };
 
 struct Import {
     PackageName name;
@@ -138,6 +141,8 @@ public:
     // The possible path prefixes associated with files in the package, including path separator at end.
     vector<std::string> packagePathPrefixes;
     PackageName name;
+    core::NameRef privateMangledName;
+
     // loc for the package definition. Used for error messages.
     core::Loc loc;
     // The names of each package imported by this package.
@@ -510,6 +515,13 @@ struct PackageInfoFinder {
             info = make_unique<PackageInfoImpl>();
             checkPackageName(ctx, nameTree);
             info->name = getPackageName(ctx, nameTree);
+
+            const string packageMangledName = info->name.mangledName.show(ctx.state);
+            const string privateMangledName = absl::StrCat(packageMangledName, "_Private");
+            auto utf8PrivateName = ctx.state.enterNameUTF8(privateMangledName);
+            auto packagerPrivateName = ctx.state.freshNameUnique(core::UniqueNameKind::Packager, utf8PrivateName, 1);
+            info->privateMangledName = ctx.state.enterNameConstant(packagerPrivateName);
+
             info->loc = core::Loc(ctx.file, classDef.loc);
         } else {
             if (auto e = ctx.beginError(classDef.loc, core::errors::Packager::MultiplePackagesInOneFile)) {
@@ -733,60 +745,54 @@ public:
 class ImportTreeBuilder final {
     // PackageInfoImpl package; // The package we are building an import tree for.
     core::NameRef pkgMangledName;
+    core::NameRef privatePkgMangledName;
     ImportTree root;
 
 public:
-    ImportTreeBuilder(const PackageInfoImpl &package) : pkgMangledName(package.name.mangledName) {}
+    ImportTreeBuilder(const PackageInfoImpl &package)
+        : pkgMangledName(package.name.mangledName), privatePkgMangledName(package.privateMangledName) {}
     ImportTreeBuilder(const ImportTreeBuilder &) = delete;
     ImportTreeBuilder(ImportTreeBuilder &&) = default;
     ImportTreeBuilder &operator=(const ImportTreeBuilder &) = delete;
     ImportTreeBuilder &operator=(ImportTreeBuilder &&) = default;
 
-    void mergeImports(const PackageInfoImpl &importedPackage, const Import &import, bool enumerate) {
+    void mergeImports(core::Context ctx, const PackageInfoImpl &importedPackage, const Import &import, bool enumerate) {
         if (enumerate) {
-          for (const auto &exp : importedPackage.exports) {
-              if (exp.type == ExportType::Public) {
-                  addImport(importedPackage, import.name.loc, exp.fqn, import.type);
-              }
-          }
+            for (const auto &exp : importedPackage.exports) {
+                if (exp.type == ExportType::Public) {
+                    addImport(ctx, importedPackage, import.name.loc, exp.fqn, import.type);
+                }
+            }
         } else {
-          const bool exportsTestConstant = absl::c_any_of(
-              importedPackage.exports,
-              [&](const auto &exp) -> bool { 
+            const bool exportsTestConstant = absl::c_any_of(importedPackage.exports, [&](const auto &exp) -> bool {
                 return isPrimaryTestNamespace(exp.fqn.parts[0]);
-              }
-          );
-          const bool exportsRealConstant = absl::c_any_of(
-              importedPackage.exports,
-              [&](const auto &exp) -> bool { 
+            });
+            const bool exportsRealConstant = absl::c_any_of(importedPackage.exports, [&](const auto &exp) -> bool {
                 return !isPrimaryTestNamespace(exp.fqn.parts[0]);
-              }
-          );
+            });
 
-          if (exportsTestConstant) {
-            addImport(importedPackage, import.name.loc, import.name.fullTestPkgName, import.type);
-          }
+            if (exportsTestConstant) {
+                addImport(ctx, importedPackage, import.name.loc, import.name.fullTestPkgName, import.type);
+            }
 
-          if (exportsRealConstant) {
-            addImport(importedPackage, import.name.loc, import.name.fullName, import.type);
-          }
+            if (exportsRealConstant) {
+                addImport(ctx, importedPackage, import.name.loc, import.name.fullName, import.type);
+            }
         }
     }
 
     // Make add imports for the test package for all normal code exported by its corresponding
     // "normal" package.
-    void mergeSelfExportsForTest(core::Context ctx, const PackageInfoImpl &pkg) {
+    void mergeSelfExports(core::Context ctx, const PackageInfoImpl &pkg) {
         for (const auto &exp : pkg.exports) {
             const auto &parts = exp.parts();
             ENFORCE(parts.size() > 0);
-            if (!isTestNamespace(ctx, parts[0])) { // Only add imports for non-test
-                auto loc = exp.fqn.loc.offsets();
-                addImport(pkg, loc, exp.fqn, ImportType::Test);
-            }
+            auto loc = exp.fqn.loc.offsets();
+            addImport(ctx, pkg, loc, exp.fqn, ImportType::Self);
         }
     }
 
-    ast::ClassDef::RHS_store makeModule(core::Context ctx, ImportType moduleType) {
+    ast::ClassDef::RHS_store makeModule(core::Context ctx, ModuleType moduleType) {
         vector<core::NameRef> parts;
         ast::ClassDef::RHS_store modRhs;
         makeModule(ctx, &root, parts, modRhs, moduleType, ImportTree::Source());
@@ -794,21 +800,32 @@ public:
     }
 
 private:
-    void addImport(const PackageInfoImpl &importedPackage, core::LocOffsets loc, const FullyQualifiedName &exportFqn,
-                   ImportType importType) {
+    void addImport(core::Context ctx, const PackageInfoImpl &importedPackage, core::LocOffsets loc,
+                   const FullyQualifiedName &exportFqn, ImportType importType) {
         ImportTree *node = &root;
+        bool newChildAdded = false;
         for (auto nameRef : exportFqn.parts) {
             auto &child = node->children[nameRef];
             if (!child) {
                 child = make_unique<ImportTree>();
+                newChildAdded = true;
             }
             node = child.get();
+        }
+        if (!newChildAdded) {
+            if (auto e = ctx.beginError(loc, core::errors::Packager::ImportConflict)) {
+                // TODO Fix flaky ordering of errors. This is strange...not being done in parallel,
+                // and the file processing order is consistent.
+                e.setHeader("Conflicting import sources for `{}`",
+                            fmt::map_join(exportFqn.parts, "::", [&](const auto &nr) { return nr.show(ctx); }));
+                e.addErrorLine(core::Loc(ctx.file, node->source.importLoc), "Conflict from");
+            }
         }
         node->source = {importedPackage.name.mangledName, loc, importType};
     }
 
     void makeModule(core::Context ctx, ImportTree *node, vector<core::NameRef> &parts, ast::ClassDef::RHS_store &modRhs,
-                    ImportType moduleType, ImportTree::Source parentSrc) {
+                    ModuleType moduleType, ImportTree::Source parentSrc) {
         auto newParentSrc = parentSrc;
         if (node->source.exists() && !parentSrc.exists()) {
             newParentSrc = node->source;
@@ -822,8 +839,11 @@ private:
             return lhs.first.show(ctx) < rhs.first.show(ctx);
         });
         for (auto const &[nameRef, child] : childPairs) {
+            bool isNonTestContext =
+                ((moduleType == ModuleType::Normal) || (moduleType == ModuleType::ExportMappingNormal));
+
             // Ignore the entire `Test::*` part of import tree if we are not in a test context.
-            if (moduleType != ImportType::Test && parts.empty() && isTestNamespace(ctx, nameRef)) {
+            if (isNonTestContext && parts.empty() && isTestNamespace(ctx, nameRef)) {
                 continue;
             }
             parts.emplace_back(nameRef);
@@ -832,11 +852,18 @@ private:
         }
 
         if (node->source.exists()) {
+            const bool isSelfImport = node->source.importType == ImportType::Self;
+            if ((!isSelfImport && moduleType == ModuleType::ExportMappingNormal) ||
+                (!isSelfImport && moduleType == ModuleType::ExportMappingTest) ||
+                (isSelfImport && moduleType == ModuleType::Normal) ||
+                (isSelfImport && moduleType == ModuleType::Test && isTestNamespace(ctx, parts[0]))) {
+                return;
+            }
+
             if (parentSrc.exists()) {
                 // A conflicting import exist. Only report errors while constructing the test output
                 // to avoid duplicate errors because test imports are a superset of normal imports.
-                bool isSelfImport = node->source.packageMangledName == pkgMangledName;
-                if (moduleType == ImportType::Test && !isSelfImport) {
+                if (moduleType == ModuleType::Test && !isSelfImport) {
                     if (auto e = ctx.beginError(node->source.importLoc, core::errors::Packager::ImportConflict)) {
                         // TODO Fix flaky ordering of errors. This is strange...not being done in parallel,
                         // and the file processing order is consistent.
@@ -845,20 +872,23 @@ private:
                         e.addErrorLine(core::Loc(ctx.file, parentSrc.importLoc), "Conflict from");
                     }
                 }
-            } else if (moduleType == ImportType::Test || node->source.importType == ImportType::Normal) {
+            } else if (moduleType != ModuleType::Normal || node->source.importType == ImportType::Normal) {
                 // Construct a module containing an assignment for an imported name:
                 // For name `A::B::C::D` imported from package `A::B` construct:
                 // module A::B::C
                 //   D = <Mangled A::B>::A::B::C::D
                 // end
-                auto assignRhs = prependPackageScope(ctx, parts2literal(parts, core::LocOffsets::none()),
-                                                     node->source.packageMangledName);
+                const auto &sourceMangledName = isSelfImport ? privatePkgMangledName : node->source.packageMangledName;
+                auto assignRhs =
+                    prependPackageScope(ctx, parts2literal(parts, core::LocOffsets::none()), sourceMangledName);
                 auto assign = ast::MK::Assign(core::LocOffsets::none(), name2Expr(parts.back(), ast::MK::EmptyTree()),
                                               std::move(assignRhs));
 
                 // Ensure import's do not add duplicate loc's in the test_module
-                auto importLoc =
-                    moduleType == node->source.importType ? node->source.importLoc : core::LocOffsets::none();
+                const bool matchingModuleTypes =
+                    (moduleType == ModuleType::Test && (node->source.importType == ImportType::Test || isSelfImport)) ||
+                    (moduleType == ModuleType::Normal);
+                auto importLoc = matchingModuleTypes ? node->source.importLoc : core::LocOffsets::none();
 
                 ast::ClassDef::RHS_store rhs;
                 rhs.emplace_back(std::move(assign));
@@ -867,15 +897,18 @@ private:
                 // imported constant: `Foo::Bar::Baz` from package `Foo::Bar`
                 //                     ^^^^^^^^       jump to the import statement
                 //                               ^^^  jump to actual definition of `Baz` class
-                auto mod = ast::MK::Module(core::LocOffsets::none(), importLoc, importModuleName(parts, importLoc), {},
-                                           std::move(rhs));
+                auto mod = ast::MK::Module(core::LocOffsets::none(), importLoc,
+                                           importModuleName(parts, importLoc, moduleType), {}, std::move(rhs));
                 modRhs.emplace_back(std::move(mod));
             }
         }
     }
 
-    ast::ExpressionPtr importModuleName(vector<core::NameRef> &parts, core::LocOffsets importLoc) const {
-        ast::ExpressionPtr name = name2Expr(pkgMangledName);
+    ast::ExpressionPtr importModuleName(vector<core::NameRef> &parts, core::LocOffsets importLoc,
+                                        ModuleType modType) const {
+        const bool isExportMapping =
+            ((modType == ModuleType::ExportMappingNormal) || (modType == ModuleType::ExportMappingTest));
+        ast::ExpressionPtr name = isExportMapping ? name2Expr(pkgMangledName) : name2Expr(privatePkgMangledName);
         for (auto part = parts.begin(); part < parts.end() - 1; part++) {
             name = name2Expr(*part, move(name));
         }
@@ -937,6 +970,8 @@ bool checkContainsAllPackages(const core::GlobalState &gs, const vector<ast::Par
 ast::ParsedFile rewritePackage(core::Context ctx, ast::ParsedFile file) {
     ast::ClassDef::RHS_store importedPackages;
     ast::ClassDef::RHS_store testImportedPackages;
+    ast::ClassDef::RHS_store exportMappingNormal;
+    ast::ClassDef::RHS_store exportMappingTest;
 
     const auto &packageDB = ctx.state.packageDB();
     auto &absPkg = packageDB.getPackageForFile(ctx, file.file);
@@ -976,20 +1011,22 @@ ast::ParsedFile rewritePackage(core::Context ctx, ast::ParsedFile file) {
             } else {
                 importedNames[imported.mangledName] = imported.loc;
                 // TODO (aadi-stripe): fix this so it's not quadratic
-                bool isOrImportsSubpackage = absl::c_any_of(
-                    package.importedPackageNames,
-                    [&](const auto &otherImport) -> bool { 
-                      return otherImport.name.fullName.isSuffix(imported.fullName);
-                    }
-                ) || package.name.fullName.isSuffix(imported.fullName); 
-                treeBuilder.mergeImports(PackageInfoImpl::from(importedPackage), import, isOrImportsSubpackage);
+                bool isOrImportsSubpackage =
+                    absl::c_any_of(package.importedPackageNames,
+                                   [&](const auto &otherImport) -> bool {
+                                       return otherImport.name.fullName.isSuffix(imported.fullName);
+                                   }) ||
+                    package.name.fullName.isSuffix(imported.fullName);
+                treeBuilder.mergeImports(ctx, PackageInfoImpl::from(importedPackage), import, isOrImportsSubpackage);
             }
         }
 
-        importedPackages = treeBuilder.makeModule(ctx, ImportType::Normal);
+        importedPackages = treeBuilder.makeModule(ctx, ModuleType::Normal);
 
-        treeBuilder.mergeSelfExportsForTest(ctx, package);
-        testImportedPackages = treeBuilder.makeModule(ctx, ImportType::Test);
+        treeBuilder.mergeSelfExports(ctx, package);
+        testImportedPackages = treeBuilder.makeModule(ctx, ModuleType::Test);
+        exportMappingNormal = treeBuilder.makeModule(ctx, ModuleType::ExportMappingNormal);
+        exportMappingTest = treeBuilder.makeModule(ctx, ModuleType::ExportMappingTest);
     }
 
     auto packageNamespace =
@@ -998,10 +1035,19 @@ ast::ParsedFile rewritePackage(core::Context ctx, ast::ParsedFile file) {
     auto testPackageNamespace =
         ast::MK::Module(core::LocOffsets::none(), core::LocOffsets::none(),
                         name2Expr(core::Names::Constants::PackageTests()), {}, std::move(testImportedPackages));
+    auto exportMappingNormalNamespace =
+        ast::MK::Module(core::LocOffsets::none(), core::LocOffsets::none(),
+                        name2Expr(core::Names::Constants::PackageRegistry()), {}, std::move(exportMappingNormal));
+    auto exportMappingTestNamespace =
+        ast::MK::Module(core::LocOffsets::none(), core::LocOffsets::none(),
+                        name2Expr(core::Names::Constants::PackageTests()), {}, std::move(exportMappingTest));
 
     auto &rootKlass = ast::cast_tree_nonnull<ast::ClassDef>(file.tree);
     rootKlass.rhs.emplace_back(move(packageNamespace));
     rootKlass.rhs.emplace_back(move(testPackageNamespace));
+    rootKlass.rhs.emplace_back(move(exportMappingNormalNamespace));
+    rootKlass.rhs.emplace_back(move(exportMappingTestNamespace));
+
     return file;
 }
 
@@ -1013,7 +1059,7 @@ ast::ParsedFile rewritePackagedFile(core::GlobalState &gs, ast::ParsedFile parse
     if (pkg.exists()) {
         auto &pkgImpl = PackageInfoImpl::from(pkg);
         parsedFile =
-            wrapFileInPackageModule(ctx, move(parsedFile), pkgImpl.name.mangledName, pkgImpl, isTestFile(gs, file));
+            wrapFileInPackageModule(ctx, move(parsedFile), pkgImpl.privateMangledName, pkgImpl, isTestFile(gs, file));
     } else {
         // Don't transform, but raise an error on the first line.
         if (auto e = ctx.beginError(core::LocOffsets{0, 0}, core::errors::Packager::UnpackagedFile)) {
