@@ -369,10 +369,10 @@ NameRef NameRef::prepend(GlobalState &gs, string_view s) const {
     return gs.enterNameUTF8(nameEq);
 }
 
-NameRef NameRef::lookupMangledPackageName(const GlobalState &gs) const {
+NameRef NameRef::lookupMangledPrivatePackageName(const GlobalState &gs) const {
     auto name = this->dataUtf8(gs);
     auto parts = absl::StrSplit(name->utf8, "::");
-    string mangledName = absl::StrCat(absl::StrJoin(parts, "_"), "_Package");
+    string mangledName = absl::StrCat(absl::StrJoin(parts, "_"), "_Package_Private");
 
     auto utf8Name = gs.lookupNameUTF8(mangledName);
     if (!utf8Name.exists()) {

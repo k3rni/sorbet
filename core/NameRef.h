@@ -172,7 +172,7 @@ public:
 
     NameRef prepend(GlobalState &gs, std::string_view s) const;
 
-    NameRef lookupMangledPackageName(const GlobalState &gs) const;
+    NameRef lookupMangledPrivatePackageName(const GlobalState &gs) const;
 
     bool isClassName(const GlobalState &gs) const;
 
