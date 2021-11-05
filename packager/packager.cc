@@ -535,7 +535,7 @@ struct PackageInfoFinder {
 
     // Bar::Baz => <PackageRegistry>::Foo_Package::Bar::Baz
     ast::ExpressionPtr prependInternalPackageName(const core::GlobalState &gs, ast::ExpressionPtr scope) {
-        return prependPackageScope(gs, move(scope), this->info->name.mangledName);
+        return prependPackageScope(gs, move(scope), this->info->privateMangledName);
     }
 
     // Generate a list of FQNs exported by this package. No export may be a prefix of another.
@@ -783,12 +783,14 @@ public:
 
     // Make add imports for the test package for all normal code exported by its corresponding
     // "normal" package.
-    void mergeSelfExports(core::Context ctx, const PackageInfoImpl &pkg) {
+    void mergeSelfExports(core::Context ctx, const PackageInfoImpl &pkg, ExportType type) {
         for (const auto &exp : pkg.exports) {
-            const auto &parts = exp.parts();
-            ENFORCE(parts.size() > 0);
-            auto loc = exp.fqn.loc.offsets();
-            addImport(ctx, pkg, loc, exp.fqn, ImportType::Self);
+            if (exp.type == type) {
+                const auto &parts = exp.parts();
+                ENFORCE(parts.size() > 0);
+                auto loc = exp.fqn.loc.offsets();
+                addImport(ctx, pkg, loc, exp.fqn, ImportType::Self);
+            }
         }
     }
 
@@ -812,7 +814,7 @@ private:
             }
             node = child.get();
         }
-        if (!newChildAdded) {
+        if (!newChildAdded && importType != ImportType::Self) {
             if (auto e = ctx.beginError(loc, core::errors::Packager::ImportConflict)) {
                 // TODO Fix flaky ordering of errors. This is strange...not being done in parallel,
                 // and the file processing order is consistent.
@@ -846,6 +848,11 @@ private:
             if (isNonTestContext && parts.empty() && isTestNamespace(ctx, nameRef)) {
                 continue;
             }
+
+            if (moduleType == ModuleType::ExportMappingTest && parts.empty() && !isTestNamespace(ctx, nameRef)) {
+                continue;
+            }
+
             parts.emplace_back(nameRef);
             makeModule(ctx, child, parts, modRhs, moduleType, newParentSrc);
             parts.pop_back();
@@ -1021,12 +1028,13 @@ ast::ParsedFile rewritePackage(core::Context ctx, ast::ParsedFile file) {
             }
         }
 
-        importedPackages = treeBuilder.makeModule(ctx, ModuleType::Normal);
-
-        treeBuilder.mergeSelfExports(ctx, package);
-        testImportedPackages = treeBuilder.makeModule(ctx, ModuleType::Test);
+        treeBuilder.mergeSelfExports(ctx, package, ExportType::Public);
         exportMappingNormal = treeBuilder.makeModule(ctx, ModuleType::ExportMappingNormal);
         exportMappingTest = treeBuilder.makeModule(ctx, ModuleType::ExportMappingTest);
+        importedPackages = treeBuilder.makeModule(ctx, ModuleType::Normal);
+
+        treeBuilder.mergeSelfExports(ctx, package, ExportType::PrivateTest);
+        testImportedPackages = treeBuilder.makeModule(ctx, ModuleType::Test);
     }
 
     auto packageNamespace =
