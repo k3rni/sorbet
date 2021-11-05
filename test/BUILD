@@ -205,7 +205,7 @@ pipeline_tests(
         [
             "testdata/packager/**/*.rb",
             "testdata/packager/**/*.exp",
-        ]
+        ],
     ),
     "PackagerTests",
     filter = "PackagerTests",
