@@ -765,10 +765,10 @@ public:
             }
         } else {
             const bool exportsTestConstant = absl::c_any_of(importedPackage.exports, [&](const auto &exp) -> bool {
-                return isPrimaryTestNamespace(exp.fqn.parts[0]);
+                return exp.type == ExportType::Public && isPrimaryTestNamespace(exp.fqn.parts[0]);
             });
             const bool exportsRealConstant = absl::c_any_of(importedPackage.exports, [&](const auto &exp) -> bool {
-                return !isPrimaryTestNamespace(exp.fqn.parts[0]);
+                return exp.type == ExportType::Public && !isPrimaryTestNamespace(exp.fqn.parts[0]);
             });
 
             if (exportsTestConstant) {
